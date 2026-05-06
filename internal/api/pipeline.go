@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path"
@@ -16,6 +17,17 @@ import (
 	"fnos-store/internal/core"
 	"fnos-store/internal/platform"
 )
+
+// selfUpdateFlushDelay is how long runSelfUpdate waits between sending the
+// 'self_update' SSE event and forking the detached appcenter-cli child.
+// The delay lets the SSE bytes reach the client's fetch reader before the
+// child kills this process during install-local's uninstall phase. Without
+// this delay the client sees a connection reset BEFORE the self_update
+// event arrives, producing a false-positive '更新请求失败' toast
+// even though the update succeeds in the background.
+// 750ms is empirically sufficient on localhost; the upper bound is bounded
+// by appcenter-cli's own startup time, which is well above 1s.
+const selfUpdateFlushDelay = 750 * time.Millisecond
 
 type installPipeline struct {
 	downloads  *core.Downloader
@@ -194,6 +206,12 @@ func runWithVirtualProgress(ctx context.Context, stream *sseStream, step, messag
 			progress += inc
 			_ = stream.sendProgress(progressPayload{Step: step, Progress: progress, Message: message})
 		case <-ctx.Done():
+			// Don't orphan the goroutine: wait for fn() to actually finish so
+			// any caller-deferred cleanup (e.g. os.Remove(fpkPath)) doesn't race
+			// with an in-flight CLI invocation that's still reading the file.
+			// cliMu already serializes operations, so blocking here doesn't add
+			// queueing pressure beyond what the next op would face anyway.
+			<-done
 			return ctx.Err()
 		}
 	}
@@ -428,10 +446,29 @@ func (p *installPipeline) runSelfUpdate(ctx context.Context, stream *sseStream, 
 		_ = stream.sendError(err.Error())
 		return
 	}
+	// dir cleanup is conditional on the InstallLocal outcome below.
 
 	_ = stream.sendProgress(progressPayload{Step: "self_update", Message: "商店正在重启..."})
 
-	// Detached: appcenter-cli runs in a new session so it survives
-	// this process being killed during the uninstall phase.
-	_ = p.ac.InstallLocal(dir, volume, true)
+	// Wait for the SSE bytes to actually reach the client. See the comment on
+	// selfUpdateFlushDelay for why this is necessary.
+	select {
+	case <-time.After(selfUpdateFlushDelay):
+	case <-ctx.Done():
+	}
+
+	// Detached: appcenter-cli runs in a new session so it survives this
+	// process being killed during install-local's uninstall phase.
+	if err := p.ac.InstallLocal(dir, volume, true); err != nil {
+		// The fork itself failed - the child never started, so it's safe
+		// (and necessary) to clean up the extracted directory here.
+		log.Printf("runSelfUpdate: InstallLocal launch failed: %v", err)
+		_ = stream.sendError(fmt.Sprintf("商店更新启动失败: %v", err))
+		_ = os.RemoveAll(dir)
+		return
+	}
+	// Success path: dir is intentionally NOT cleaned up - the detached child
+	// reads it asynchronously after cmd.Start() returns, and fnOS will kill
+	// this process before any deferred cleanup could run. /tmp is wiped on
+	// reboot.
 }

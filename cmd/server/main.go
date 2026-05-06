@@ -91,9 +91,19 @@ func main() {
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		<-sigCh
 		log.Println("shutting down...")
-		cancel()
 		sched.Stop()
-		httpServer.Close()
+		// Graceful shutdown: drain in-flight SSE streams and CLI ops before
+		// closing the listener. The detached appcenter-cli child started by
+		// runSelfUpdate is already in its own session (Setsid) so SIGTERM to
+		// the parent does NOT propagate to it; this drain is for normal
+		// systemd/manual restarts, not for the self-update kill path.
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer shutdownCancel()
+		if err := httpServer.Shutdown(shutdownCtx); err != nil {
+			log.Printf("graceful shutdown failed, forcing close: %v", err)
+			_ = httpServer.Close()
+		}
+		cancel()
 	}()
 
 	log.Printf("fnos-store listening on %s", addr)

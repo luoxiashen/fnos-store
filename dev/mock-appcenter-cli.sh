@@ -57,6 +57,36 @@ cmd_status() {
     fi
 }
 
+cmd_install_local() {
+    local dir=""
+    local volume=1
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dir) dir="$2"; shift 2 ;;
+            -v|--volume) volume="$2"; shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+        echo "install-local: --dir required and must exist" >&2
+        exit 1
+    fi
+    # Mock: read manifest from extracted fpk dir, mark app installed.
+    # The real CLI also uninstalls the previous version (which kills this
+    # parent process for self-update). For dev convenience we just no-op.
+    local manifest="$dir/manifest"
+    if [ -f "$manifest" ]; then
+        local appname
+        appname=$(grep '^appname' "$manifest" | cut -d= -f2 | tr -d ' ')
+        if [ -n "$appname" ]; then
+            echo "running" > "$MOCK_STATE_DIR/$appname"
+            echo "Installed $appname (local) to volume $volume"
+            return 0
+        fi
+    fi
+    echo "Installed (local) to volume $volume"
+}
+
 cmd_install_fpk() {
     local fpk_path="$1"
     shift
@@ -113,13 +143,14 @@ case "${1:-}" in
     check)          cmd_check "${2:?appname required}" ;;
     status)         cmd_status "${2:?appname required}" ;;
     install-fpk)    shift; cmd_install_fpk "$@" ;;
+    install-local)  shift; cmd_install_local "$@" ;;
     uninstall)      cmd_uninstall "${2:?appname required}" ;;
     start)          cmd_start "${2:?appname required}" ;;
     stop)           cmd_stop "${2:?appname required}" ;;
     default-volume) cmd_default_volume ;;
     *)
         echo "Usage: mock-appcenter-cli.sh <command> [args]"
-        echo "Commands: list, check, status, install-fpk, uninstall, start, stop, default-volume"
+        echo "Commands: list, check, status, install-fpk, install-local, uninstall, start, stop, default-volume"
         exit 1
         ;;
 esac

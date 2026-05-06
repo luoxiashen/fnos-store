@@ -23,6 +23,7 @@ import {
   RefreshCw,
   BellOff,
   Bell,
+  Loader2,
 } from 'lucide-react';
 
 interface AppDetailDialogProps {
@@ -36,7 +37,7 @@ interface AppDetailDialogProps {
   operation?: AppOperation;
 }
 
-const AppDetailDialog: React.FC<AppDetailDialogProps> = ({ app, open, onOpenChange, onInstall, onUpdate, onIgnoreUpdate, onUnignoreUpdate }) => {
+const AppDetailDialog: React.FC<AppDetailDialogProps> = ({ app, open, onOpenChange, onInstall, onUpdate, onIgnoreUpdate, onUnignoreUpdate, operation }) => {
   if (!app) return null;
 
   const isInstalled = app.installed;
@@ -219,7 +220,12 @@ const AppDetailDialog: React.FC<AppDetailDialogProps> = ({ app, open, onOpenChan
               取消忽略
             </Button>
           )}
-          {!isInstalled ? (
+          {operation ? (
+            <Button size="sm" disabled className="rounded-full px-4">
+              <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+              {operation.message || '处理中...'}
+            </Button>
+          ) : !isInstalled ? (
             <Button
               size="sm"
               onClick={() => { onOpenChange(false); onInstall(app); }}

@@ -36,6 +36,14 @@ func (s *Scheduler) Start(ctx context.Context) {
 		return
 	}
 	s.running = true
+	// Recreate stopCh so the scheduler can be restarted after Stop().
+	// Without this, a Stop()+Start() cycle would immediately exit because
+	// the closed channel always selects.
+	select {
+	case <-s.stopCh:
+		s.stopCh = make(chan struct{})
+	default:
+	}
 	s.mu.Unlock()
 
 	log.Printf("scheduler: checking every %s", s.interval)

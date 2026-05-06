@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { LayoutGrid, CheckCircle2, RefreshCw, Settings, MessageCircle, Menu, ChevronsLeft, ChevronsRight, Search, X, Film, ArrowDownToLine, BookOpen, Wrench, Globe, LayoutList, ArrowUpDown, Loader2, CircleX, CircleCheck, WifiOff, ExternalLink, Package, Compass, Brain, Clapperboard, Network } from 'lucide-react';
 import { Button } from './components/ui/button';
 import { Input } from './components/ui/input';
@@ -64,6 +64,23 @@ const App: React.FC = () => {
   const [appOperations, setAppOperations] = useState<Map<string, AppOperation>>(new Map());
   const [selfUpdateActive, setSelfUpdateActive] = useState(false);
   const [selfUpdateState, setSelfUpdateState] = useState<{message: string; progress: number; speed?: number; downloaded?: number; total?: number} | null>(null);
+  // selfUpdateActiveRef tracks whether the self-update OVERLAY should be shown.
+  // It can be set optimistically (handleStoreUpdate sets it BEFORE the SSE opens).
+  // selfUpdateRestartSeenRef tracks whether the backend has actually emitted the
+  // 'self_update' SSE event - meaning the server is committed to killing itself
+  // and a subsequent connection drop is EXPECTED, not a failure.
+  // Catch blocks must read selfUpdateRestartSeenRef (not selfUpdateActiveRef)
+  // when deciding whether to suppress the error toast, otherwise pre-SSE failures
+  // (HTTP 409, network errors) get silently swallowed.
+  const selfUpdateActiveRef = useRef(false);
+  const selfUpdateRestartSeenRef = useRef(false);
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reloadHandleRef = useRef<{ cancel: () => void } | null>(null);
+  const appOperationsRef = useRef<Map<string, AppOperation>>(new Map());
+  // Keep ref synced with state so guards in event handlers see current value
+  // without forcing them to depend on appOperations (which would re-create
+  // them on every progress update and trigger child re-renders).
+  appOperationsRef.current = appOperations;
 
   const [settingsVisible, setSettingsVisible] = useState(false);
   const [storeHasUpdate, setStoreHasUpdate] = useState(false);
@@ -92,6 +109,15 @@ const App: React.FC = () => {
     loadApps();
     fetchStoreUpdate().then(info => setStoreHasUpdate(info.has_update)).catch(() => {});
     fetchRecommended().then(data => setRecommendedApps(data.apps)).catch(() => {});
+    return () => {
+      // Cleanup on unmount: cancel pending poll timer and any in-flight reload SSE
+      if (pollTimerRef.current) {
+        clearTimeout(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+      reloadHandleRef.current?.cancel();
+      reloadHandleRef.current = null;
+    };
   }, []);
 
   const setAppOp = useCallback((appname: string, op: AppOperation | null) => {
@@ -106,9 +132,13 @@ const App: React.FC = () => {
     });
   }, []);
 
-  const pollForRestart = () => {
+  const pollForRestart = useCallback(() => {
+    // Dedup: createSSEHandler and handleStoreUpdate may both call this.
+    if (pollTimerRef.current) return;
+
     let retries = 0;
     const poll = async () => {
+      pollTimerRef.current = null;
       try {
         await fetchStatus();
         window.location.reload();
@@ -119,11 +149,11 @@ const App: React.FC = () => {
           return;
         }
         setSelfUpdateState({ message: '正在重启...', progress: 100 });
-        setTimeout(poll, 2000);
+        pollTimerRef.current = setTimeout(poll, 2000);
       }
     };
-    setTimeout(poll, 2000);
-  };
+    pollTimerRef.current = setTimeout(poll, 2000);
+  }, []);
 
   const translateStep = (step?: string) => {
       switch(step) {
@@ -156,6 +186,9 @@ const App: React.FC = () => {
   };
 
   const triggerReload = () => {
+    // Cancel any in-flight reload SSE before starting a new one.
+    reloadHandleRef.current?.cancel();
+
     setLoadStatus('retrying');
     setLoadMessages([]);
 
@@ -186,10 +219,15 @@ const App: React.FC = () => {
         setLoadStatus('failed');
       }
     });
+    reloadHandleRef.current = handle;
 
     handle.promise.catch(() => {
       setLoadStatus('failed');
       setLoadMessages(prev => [...prev, { text: '网络连接失败', status: 'error' }]);
+    }).finally(() => {
+      if (reloadHandleRef.current === handle) {
+        reloadHandleRef.current = null;
+      }
     });
   };
 
@@ -198,6 +236,8 @@ const App: React.FC = () => {
 
     if (data.step === 'self_update') {
       setSelfUpdateActive(true);
+      selfUpdateActiveRef.current = true;
+      selfUpdateRestartSeenRef.current = true;
       setSelfUpdateState({ message: data.message || '商店正在更新，请稍候...', progress: 100 });
       pollForRestart();
       return;
@@ -247,14 +287,10 @@ const App: React.FC = () => {
 
   const handleInstall = useCallback(async (app: AppInfo) => {
     const appname = app.appname;
+    // Guard: prevent double-trigger overwriting an in-flight operation's cancel handle.
+    if (appOperationsRef.current.has(appname)) return;
+
     const handler = createSSEHandler(app, 'install');
-
-    setAppOp(appname, {
-      step: 'starting',
-      progress: 0,
-      message: `正在安装 ${app.display_name}...`,
-    });
-
     const handle = installApp(appname, handler);
     setAppOp(appname, {
       step: 'starting',
@@ -271,31 +307,35 @@ const App: React.FC = () => {
         setAppOp(appname, null);
         return;
       }
+      // Self-update path: backend kills itself; SSE drop is expected ONLY
+      // after we have actually seen the 'self_update' event.
+      // pollForRestart() (started by self_update event) handles recovery.
+      if (selfUpdateRestartSeenRef.current) {
+        return;
+      }
       console.error(error);
       toast.error('安装请求失败');
     } finally {
+      const hadOperation = appOperationsRef.current.has(appname);
       setAppOperations(prev => {
-        if (prev.has(appname)) {
-          const next = new Map(prev);
-          next.delete(appname);
-          loadApps();
-          return next;
-        }
-        return prev;
+        if (!prev.has(appname)) return prev;
+        const next = new Map(prev);
+        next.delete(appname);
+        return next;
       });
+      // Skip loadApps during self-update: the server is restarting and the
+      // poll-then-reload flow will refresh the entire page anyway.
+      if (hadOperation && !selfUpdateActiveRef.current) {
+        loadApps();
+      }
     }
   }, [createSSEHandler, setAppOp]);
 
   const handleUpdate = useCallback(async (app: AppInfo) => {
     const appname = app.appname;
+    if (appOperationsRef.current.has(appname)) return;
+
     const handler = createSSEHandler(app, 'update');
-
-    setAppOp(appname, {
-      step: 'starting',
-      progress: 0,
-      message: `正在更新 ${app.display_name}...`,
-    });
-
     const handle = updateApp(appname, handler);
     setAppOp(appname, {
       step: 'starting',
@@ -312,18 +352,22 @@ const App: React.FC = () => {
         setAppOp(appname, null);
         return;
       }
+      if (selfUpdateRestartSeenRef.current) {
+        return;
+      }
       console.error(error);
       toast.error('更新请求失败');
     } finally {
+      const hadOperation = appOperationsRef.current.has(appname);
       setAppOperations(prev => {
-        if (prev.has(appname)) {
-          const next = new Map(prev);
-          next.delete(appname);
-          loadApps();
-          return next;
-        }
-        return prev;
+        if (!prev.has(appname)) return prev;
+        const next = new Map(prev);
+        next.delete(appname);
+        return next;
       });
+      if (hadOperation && !selfUpdateActiveRef.current) {
+        loadApps();
+      }
     }
   }, [createSSEHandler, setAppOp]);
 
@@ -358,15 +402,16 @@ const App: React.FC = () => {
       console.error(error);
       toast.error('卸载请求失败');
     } finally {
+      const hadOperation = appOperationsRef.current.has(appname);
       setAppOperations(prev => {
-        if (prev.has(appname)) {
-          const next = new Map(prev);
-          next.delete(appname);
-          loadApps();
-          return next;
-        }
-        return prev;
+        if (!prev.has(appname)) return prev;
+        const next = new Map(prev);
+        next.delete(appname);
+        return next;
       });
+      if (hadOperation) {
+        loadApps();
+      }
     }
   }, [pendingUninstallApp, createSSEHandler, setAppOp]);
 
@@ -402,10 +447,12 @@ const App: React.FC = () => {
 
   const handleStoreUpdate = useCallback(async () => {
     setSelfUpdateActive(true);
+    selfUpdateActiveRef.current = true;
     setSelfUpdateState({ message: '正在更新商店...', progress: 0 });
 
     const handle = triggerStoreUpdate((data) => {
       if (data.step === 'self_update') {
+        selfUpdateRestartSeenRef.current = true;
         setSelfUpdateState({ message: '商店正在重启...', progress: 100 });
         pollForRestart();
         return;
@@ -413,6 +460,7 @@ const App: React.FC = () => {
       if (data.step === 'error') {
         toast.error(data.message || '商店更新失败');
         setSelfUpdateActive(false);
+        selfUpdateActiveRef.current = false;
         setSelfUpdateState(null);
         return;
       }
@@ -429,9 +477,16 @@ const App: React.FC = () => {
       await handle.promise;
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return;
+      // Only suppress the toast if the backend actually emitted the self_update
+      // event - otherwise pre-SSE failures (HTTP 409, network errors) would be
+      // silently swallowed and the overlay would be stuck at 0% forever.
+      if (selfUpdateRestartSeenRef.current) {
+        return;
+      }
       console.error(error);
       toast.error('商店更新失败');
       setSelfUpdateActive(false);
+      selfUpdateActiveRef.current = false;
       setSelfUpdateState(null);
     }
   }, []);

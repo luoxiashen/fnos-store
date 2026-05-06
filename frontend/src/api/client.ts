@@ -121,6 +121,22 @@ function streamSSE(url: string, onEvent: SSECallback): SSEHandle {
     let buffer = '';
     let pendingData = '';
 
+    const dispatchPending = () => {
+      if (!pendingData) return;
+      try {
+        onEvent(JSON.parse(pendingData));
+      } catch (e) {
+        // Don't silently drop terminal events ('done' / 'error') -- log so
+        // we can debug a UI stuck in a spinner. Truncate the raw payload to
+        // avoid leaking large/sensitive data into the browser console.
+        const preview = pendingData.length > 200
+          ? pendingData.slice(0, 200) + `...(+${pendingData.length - 200} chars)`
+          : pendingData;
+        console.warn('streamSSE: failed to parse event payload', e, 'preview:', preview);
+      }
+      pendingData = '';
+    };
+
     try {
       while (true) {
         const { done, value } = await reader.read();
@@ -130,17 +146,29 @@ function streamSSE(url: string, onEvent: SSECallback): SSEHandle {
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
 
-        for (const line of lines) {
+        for (const rawLine of lines) {
+          // Trim trailing CR so CRLF-style streams (some proxies/servers) parse correctly.
+          const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
           if (line.startsWith('data: ')) {
-            pendingData = line.slice(6);
+            // SSE spec: multiple consecutive data: lines are joined with newline.
+            pendingData += (pendingData ? '\n' : '') + line.slice(6);
           } else if (line === '' && pendingData) {
-            try {
-              onEvent(JSON.parse(pendingData));
-            } catch { /* ignore parse errors */ }
-            pendingData = '';
+            dispatchPending();
           }
         }
       }
+      // EOF flush: if the stream ends after a 'data:' line but BEFORE the
+      // blank-line terminator (e.g. server killed mid-event), dispatch what
+      // we have. Without this, the final 'done' / 'error' event can be lost,
+      // leaving the UI stuck on a spinner.
+      buffer += decoder.decode();
+      if (buffer) {
+        const tail = buffer.endsWith('\r') ? buffer.slice(0, -1) : buffer;
+        if (tail.startsWith('data: ')) {
+          pendingData += (pendingData ? '\n' : '') + tail.slice(6);
+        }
+      }
+      dispatchPending();
     } finally {
       reader.releaseLock();
     }

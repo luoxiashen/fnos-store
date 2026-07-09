@@ -159,7 +159,7 @@ func (p *installPipeline) startApp(appname string) error {
 	})
 }
 
-func (p *installPipeline) verifyInstalled(appname string) error {
+func (p *installPipeline) verifyInstalled(ctx context.Context, appname string) error {
 	var installed bool
 	err := p.queue.WithCLI(func() error {
 		var e error
@@ -172,6 +172,7 @@ func (p *installPipeline) verifyInstalled(appname string) error {
 	if !installed {
 		return fmt.Errorf("安装后验证失败，应用未正确安装")
 	}
+	_ = ctx
 	return nil
 }
 
@@ -401,7 +402,7 @@ func (p *installPipeline) runStandard(ctx context.Context, stream *sseStream, op
 	}
 
 	if err := runWithVirtualProgress(ctx, stream, "verifying", "正在验证安装...", func() error {
-		return p.verifyInstalled(app.AppName)
+		return p.verifyInstalled(ctx, app.AppName)
 	}); err != nil {
 		_ = stream.sendError(err.Error())
 		return

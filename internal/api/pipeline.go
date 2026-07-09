@@ -195,21 +195,70 @@ var verifyWait = func(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// verifyInstalled polls appcenter-cli check with backoff to survive fnOS's
+// asynchronous post-install registration commit. A single-shot check races
+// the DB write and reports the app as not installed, producing the
+// "安装后验证失败" toast reported in conversun/fnos-apps#181.
+//
+// Semantics:
+//   - Attempt 1 fires immediately (verifyRetryDelays[0] == 0).
+//   - Subsequent attempts pace to ~20s total budget.
+//   - Hard CLI errors (Check returns err != nil) short-circuit — no retry,
+//     since these indicate a real CLI/config failure, not a race.
+//   - ctx cancellation is honored between attempts via verifyWait.
+//   - Final fallback: if all Check attempts return installed=false but
+//     List() shows the app registered with a sane status (running|stopped),
+//     treat as installed. Reject unknown/empty status to avoid masking
+//     partial-install failures.
 func (p *installPipeline) verifyInstalled(ctx context.Context, appname string) error {
-	var installed bool
-	err := p.queue.WithCLI(func() error {
+	for i, delay := range verifyRetryDelays {
+		if err := verifyWait(ctx, delay); err != nil {
+			return err
+		}
+		var installed bool
+		err := p.queue.WithCLI(func() error {
+			var e error
+			installed, e = p.ac.Check(appname)
+			return e
+		})
+		if err != nil {
+			return err
+		}
+		log.Printf("verifyInstalled: %s attempt %d/%d installed=%v", appname, i+1, len(verifyRetryDelays), installed)
+		if installed {
+			return nil
+		}
+	}
+	// Fallback: List() is a broader signal that tolerates Check() output drift
+	// (locale, status suffixes). Accept only when the app row is present AND
+	// has a sane status — reject unknown/empty to avoid blessing broken installs.
+	var apps []platform.InstalledApp
+	listErr := p.queue.WithCLI(func() error {
 		var e error
-		installed, e = p.ac.Check(appname)
+		apps, e = p.ac.List()
 		return e
 	})
-	if err != nil {
-		return err
+	if listErr != nil {
+		log.Printf("verifyInstalled: %s List() fallback failed: %v", appname, listErr)
+	} else {
+		for _, a := range apps {
+			if a.AppName == appname && (a.Status == "running" || a.Status == "stopped") {
+				log.Printf("verifyInstalled: %s matched via List() fallback status=%s", appname, a.Status)
+				return nil
+			}
+		}
 	}
-	if !installed {
-		return fmt.Errorf("安装后验证失败，应用未正确安装")
+	return fmt.Errorf("安装后验证失败：应用未在 appcenter 注册（重试 %d 次共 %s 后仍未检出）。请查看应用日志或稍后重试", len(verifyRetryDelays), verifyTotal())
+}
+
+// verifyTotal returns the total wall-clock time verifyInstalled will spend
+// on Check retries before giving up and consulting List().
+func verifyTotal() time.Duration {
+	var t time.Duration
+	for _, d := range verifyRetryDelays {
+		t += d
 	}
-	_ = ctx
-	return nil
+	return t
 }
 
 func runWithVirtualProgress(ctx context.Context, stream *sseStream, step, message string, fn func() error) error {

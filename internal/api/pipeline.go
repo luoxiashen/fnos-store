@@ -159,6 +159,42 @@ func (p *installPipeline) startApp(appname string) error {
 	})
 }
 
+// verifyRetryDelays are the sleep durations between successive Check() attempts
+// inside verifyInstalled. The first entry MUST be 0 so the first Check fires
+// immediately; subsequent entries pace the retry loop out to ~20s total to
+// survive fnOS appcenter-cli's async post-install registration commit.
+// See GitHub issue conversun/fnos-apps#181.
+var verifyRetryDelays = []time.Duration{
+	0,
+	500 * time.Millisecond,
+	1 * time.Second,
+	2 * time.Second,
+	3 * time.Second,
+	3 * time.Second,
+	4 * time.Second,
+	6 * time.Second,
+}
+
+// verifyWait sleeps for d respecting ctx. Returns ctx.Err() if canceled.
+// It is a package variable so tests can override it to skip real sleeps
+// while preserving ctx-cancellation semantics.
+var verifyWait = func(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
+}
+
 func (p *installPipeline) verifyInstalled(ctx context.Context, appname string) error {
 	var installed bool
 	err := p.queue.WithCLI(func() error {
